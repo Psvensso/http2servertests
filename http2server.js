@@ -1,43 +1,116 @@
 var fs = require('fs');
 var path = require('path');
 var http2 = require('http2');
+var connect = require('connect');
+var app = connect();
+var Builder = require("systemjs-builder");
 
-// The callback to handle requests
-function onRequest(request, response) {
-    var filename = path.join(__dirname, request.url);
-    if(request.url === "/"){
-        response.writeHead(200);
-        fs.createReadStream(path.join(__dirname, "/index.html"))
-            .pipe(response)
-            .on('finish',response.end);
+/**
+ * Get the config from our config.js file that JSPM sets up for us.
+ * */
+var confLoad = {};
+var System = {
+    config: function (cfg) {
+        confLoad = cfg;
     }
-    else if ((filename.indexOf(__dirname) === 0) && fs.existsSync(filename) && fs.statSync(filename).isFile()) {
+};
+var source;
+try {
+    source = fs.readFileSync('./config.js');
+}
+catch (e) {
+    source = '';
+}
+var cfg = {};
+var System = {
+    config: function (_cfg) {
+        for (var c in _cfg) {
+            if (!_cfg.hasOwnProperty(c))
+                continue;
+
+            var v = _cfg[c];
+            if (typeof v === 'object') {
+                cfg[c] = cfg[c] || {};
+                for (var p in v) {
+                    if (!v.hasOwnProperty(p))
+                        continue;
+                    cfg[c][p] = v[p];
+                }
+            }
+            else
+                cfg[c] = v;
+        }
+    },
+    paths: {},
+    map: {},
+    versions: {}
+};
+eval(source.toString());
+
+var config = System.config;
+delete System.config;
+config(System);
+
+/**
+ * Create a new builder based on the conf.
+ * */
+var builder = new Builder(cfg);
+
+function returnStatic(filename, response) {
+    if ((filename.indexOf(__dirname) === 0) && fs.existsSync(filename) && fs.statSync(filename).isFile()) {
         response.writeHead(200);
-        var fileStream = fs.createReadStream(filename);
+        fileStream = fs.createReadStream(filename);
         fileStream.pipe(response);
-        fileStream.on('finish',response.end);
+        fileStream.on('finish', response.end);
     }
-    else {
-        response.writeHead(404);
-        response.end();
+}
+
+function handleBundleResponse(response, deps) {
+    bundleCache["main"] = deps;
+    for (var key in deps) {
+        //Push the "file"/"path"/"module"
+        var path = deps[key].normalized.replace("file://", "");
+        var push = response.push(path);
+        //Insert content here.
+        //Perhaps do something smart with the originalSource here as well.
+        push.end(deps[key].source);
     }
 
 }
+var bundleCache = {};
+app.use(function (request, response) {
+    var filename = path.join(__dirname, request.url);
+    /**
+     *  Should actually figure out  if request is for a bundle here.
+     *  For now, hard coded to my main bundle.
+     *  Should also cache the build result so we just need to trance the first req.
+     **/
+    if (request.url.indexOf("main.js") > -1) {
+        if (!!bundleCache["main"]) {
+            handleBundleResponse(response, bundleCache["main"]);
+            returnStatic(filename, response);
+        } else {
+            builder.trace("main")
+                .then(handleBundleResponse.bind(this, response))
+                .then(function () {
+                    returnStatic(filename, response);
+                });
+        }
 
-// Creating a bunyan logger (optional)
-var log = require('./util').createLogger('server');
 
-// Creating the server in plain or TLS mode (TLS mode is the default)
-var server;
-if (process.env.HTTP2_PLAIN) {
-    server = http2.raw.createServer({
-        log: log
-    }, onRequest);
-} else {
-    server = http2.createServer({
-        log: log,
-        key: fs.readFileSync(path.join(__dirname, '/localhost.key')),
-        cert: fs.readFileSync(path.join(__dirname, '/localhost.crt'))
-    }, onRequest);
-}
-server.listen(443);
+    } else {
+        returnStatic(filename, response);
+    }
+
+
+});
+var compression = require('compression');
+app.use(compression());
+
+var server = http2.createServer({
+    key: fs.readFileSync(path.join(__dirname, '/localhost.key')),
+    cert: fs.readFileSync(path.join(__dirname, '/localhost.crt'))
+}, app);
+
+server.listen(process.env.HTTP2_PORT || 8080);
+
